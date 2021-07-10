@@ -3,11 +3,27 @@ import binascii
 import struct
 from shutil import copyfile
 
-
 def hexdump(data):
     if data is None:
         return
     return binascii.b2a_hex(data).decode('utf-8')
+
+def print_diff(b1, b2, width=16):
+    if len(b1) != len(b2):
+        print(f'different len {len(b1)} / {len(b2)}')
+    for i in range(len(b1) // width):
+        piece1 = b1[i*width:i*width+width]
+        piece2 = b2[i*width:i*width+width]
+
+        diff = ''
+        for j in range(width):
+            if piece1[j] == piece2[j]:
+                diff += '  '
+            else:
+                diff += '!!'
+
+        print(diff)
+        print(hexdump(piece1), ' ', hexdump(piece2))
 
 
 def unpack(fmt, data, start=0):
@@ -218,9 +234,8 @@ class BytesWriter:
         self.pos = off
 
 class FileHandler:
-    def __init__(self, src, dst):
-        self.f = open(src, "rb")
-        self.fo = open(dst, "r+b")
+    def __init__(self, filename):
+        self.f = open(filename, "r+b")
 
     def read(self, count):
         bs = self.f.read(count)
@@ -238,12 +253,14 @@ class FileHandler:
     def seek(self, off):
         self.f.seek(off, 0)
 
+    def write(self, data):
+        self.f.write(data)
+
     def tell(self):
         return self.f.tell()
 
     def close(self):
         self.f.close()
-        self.fo.close()
 
 
 class Entry:
@@ -320,7 +337,8 @@ class LeafEntry(Entry):
         self.print_if()
 
 class Page:
-    def __init__(self, fh: FileHandler, pagesize):
+    def __init__(self, fh: FileHandler, i, pagesize):
+        self.i = i
         self.fh = fh
         self.offset = fh.f.tell()
         br = BytesReader(fh.f.read(pagesize))
@@ -398,10 +416,13 @@ class Page:
         for ent in sorted(self.entries, key=lambda e: e.recofs, reverse=True):
             # walk page entries data backwards and move left if expanded
             if ent.i == ix:
-                ent.val = newval
                 total_expand += len(newval) - ent.vallen
+                ent.val = newval
+                ent.vallen = len(newval)
             ent.recofs -= total_expand
-        if total_expand > self.free_bytes:
+
+        self.free_bytes -= total_expand
+        if self.free_bytes < 0:
             raise NotImplementedError("no more space in this page")
 
         bw = BytesWriter(self.br.data)
@@ -415,8 +436,8 @@ class Page:
         for ent in self.entries:
             ent.write_data(bw)
 
-        self.fh.fo.seek(self.offset)
-        self.fh.fo.write(bw.data)
+        self.fh.seek(self.offset)
+        self.fh.write(bw.data)
 
 
 class Cursor:
@@ -497,7 +518,9 @@ class Cursor:
 class ID0:
     def __init__(self, fh, args):
         self.fh = fh
-        compressed, sectlen = self.fh.reads("BQ")
+        comp, sectlen = self.fh.reads("BQ")
+        if comp:
+            raise NotImplementedError("compressed")
         self.start = fh.tell()
 
         btreedata = self.fh.read(64)
@@ -518,7 +541,7 @@ class ID0:
 
     def readpage(self, nr):
         self.fh.seek(self.start + nr * self.pagesize)
-        return Page(self.fh, self.pagesize)
+        return Page(self.fh, nr, self.pagesize)
 
     def namekey(self, name):
         if type(name) == int:
@@ -573,14 +596,14 @@ class ID0:
         endkey = makekey(nodeid, tag, end)
         cur = self.find('ge', startkey)
         data = b''
-        pages = set()
+        affected = set()
         while cur.getkey() <= endkey:
-            page, ix = cur.getpageix()
-            pages.add((page, ix))
-            chunk = page.entries[ix].val
+            page, entry_i = cur.getpageix()
+            affected.add((page.i, entry_i))
+            chunk = page.entries[entry_i].val
             data += chunk
             cur.next()
-        return data, pages
+        return data, affected
 
 class IDBFile:
     def __init__(self, fh: FileHandler):
@@ -598,17 +621,25 @@ class IDBFile:
 
 
 def processfile(args):
-    fh = FileHandler(args.srcfile, args.destfile)
+    fh = FileHandler(args.target)
     idb = IDBFile(fh)
     id0 = ID0(idb.fh, args)
 
-    if args.list:
-        fdl = FuncDirList(id0)
+    fdl = FuncDirList(id0)
+    if args.listbefore:
         fdl.print()
 
+    if args.check:
+        fdl.checktree()
+
     if args.rename:
-        fdl = FuncDirList(id0)
-        fdl.rename(args)
+        fdl.rename(args.rename)
+
+    if args.move:
+        fdl.move(args.move)
+
+    if args.listafter:
+        fdl.print()
 
     fh.close()
 
@@ -629,30 +660,66 @@ class FuncDirList:
         # sorted_dirs = [v for v in sorted_dirs]
         # print(sorted_dirs)
 
-        self.dirs = []
-        i = self.first_dir
+        self.dirs = {}
+        i = 0
         while True:
             start = i * 0x10000
             end = start + 0xFFFF
             data, affected = id0.blob(rootnode, 'S', start, end)
             if data == b'':
                 break
-            self.dirs.append(FuncDir(i, data, affected))
+            self.dirs[i] = FuncDir(id0, i, data, affected)
             i += 1
+            if 0 < i < self.first_dir:
+                i = self.first_dir
         if i > self.afterlast_dir:
             raise Exception("directory count mismatch")
 
     def print(self):
-        for d in self.dirs:
+        for d in self.dirs.values():
             d.print()
 
     def rename(self, args):
         for d in self.dirs:
             d.rename(args)
 
+    def move(self, args):
+        i, newparent = args
+        oldparent = self.dirs[i].parent
+        self.dirs[oldparent].subdirs.remove(i)
+        self.dirs[oldparent].save()
+        self.dirs[newparent].subdirs.append(i)
+        self.dirs[newparent].save()
+        self.dirs[i].parent = newparent
+        self.dirs[i].save()
+
+    def checktree(self):
+        # check if parent of A has A as subdir
+        for i, d in self.dirs.items():
+            if i == 0:
+                continue
+            if d.parent not in self.dirs:
+                print(f'dir {i} has parent {d.parent} but {d.parent} is not in tree')
+                continue
+            subdirs = self.dirs[d.parent].subdirs
+            if i not in subdirs:
+                print(f'dir {i} has parent {d.parent} but {d.parent} has no subdir {i}')
+
+        # check if subdirs of A have A as parent
+        for i, d in self.dirs.items():
+            for subdir in d.subdirs:
+                if subdir not in self.dirs:
+                    print(f'dir {i} has subdir {subdir} but {subdir} is not in tree')
+                    continue
+                subdir_parent = self.dirs[subdir].parent
+                if subdir_parent != i:
+                    print(f'dir {i} has subdir {subdir} but {subdir} parent is {subdir_parent}')
+
+        print('check complete')
 
 class FuncDir:
-    def __init__(self, i, data, affected):
+    def __init__(self, id0: ID0, i, data, affected):
+        self.id0 = id0
         self.i = i
         self.modified = False
         self.affected = affected
@@ -699,7 +766,7 @@ class FuncDir:
         #         print("%x %s" % (func, name))
 
     def rename(self, args):
-        newname = self.name.replace(*args.rename)
+        newname = self.name.replace(*args)
         if newname != self.name:
             self.modified = True
             self.name = newname
@@ -737,26 +804,33 @@ class FuncDir:
     def save(self):
         print('saving FuncDir', self.i)
         if len(self.affected) > 1:
-            raise NotImplementedError("dir data Blob spans across multiple Entries")
-        for page, ix in self.affected:
-            print(f'  affected page {page} entry {ix}')
+            raise NotImplementedError("dir data spans across multiple Entries")
+        for page_i, entry_i in self.affected:
+            print(f'  affected page {page_i} entry {entry_i}')
             newdata = self.pack()
-            page.rebuild(ix, newdata)
+            page = self.id0.readpage(page_i)
+            page.rebuild(entry_i, newdata)
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(epilog="""
-Makes a copy of .i64 file with certain modifications.
+Modifies function folder tree data inside a .i64 file.
 
 Examples:
 
-  i64edit in.i64 out.i64 --rename FolderNameBad FolderNameGood
+  i64edit target.i64 --list --check
+  i64edit target.i64 --rename BadDirName GoodDirName
+  i64edit --copyfrom in.i64 out.i64 --move 12 14
 """)
-    parser.add_argument("srcfile")
-    parser.add_argument("destfile")
-    parser.add_argument('--list', action='store_true', help='print folder names')
-    parser.add_argument('--rename', nargs=2, help='search and replace in folder names')
+    parser.add_argument("--copyfrom")
+    parser.add_argument("target")
+    parser.add_argument('--listbefore', action='store_true', help='print initial funcdir structure')
+    parser.add_argument('--listafter', action='store_true', help='print modified funcdir structure')
+    parser.add_argument('--check', action='store_true', help='print consistency check results')
+    parser.add_argument('--rename', nargs=2, help='string search and replace in folder names')
+    parser.add_argument('--move', nargs=2, type=int, help='move folder #i to a new parent #j')
     args = parser.parse_args()
 
-    copyfile(args.srcfile, args.destfile)
+    if args.copyfrom:
+        copyfile(args.copyfrom, args.target)
     processfile(args)
