@@ -1,6 +1,8 @@
 import argparse
 import binascii
+import io
 import struct
+import zlib
 from shutil import copyfile
 
 def hexdump(data):
@@ -107,7 +109,6 @@ class IdaUnpacker:
         else:
             return None
 
-
 class IdaPacker:
     def __init__(self):
         self.data = bytearray()
@@ -143,7 +144,6 @@ class IdaPacker:
             # 1111 1111 xxxx xxxx xxxx xxxx xxxx xxxx xxxx xxxx
             b = struct.pack(">BI", 0xFF, val)
         self.data += b
-
 
 class BytesReader:
     def __init__(self, data):
@@ -340,8 +340,8 @@ class Page:
     def __init__(self, fh: FileHandler, i, pagesize):
         self.i = i
         self.fh = fh
-        self.offset = fh.f.tell()
-        br = BytesReader(fh.f.read(pagesize))
+        self.offset = fh.tell()
+        br = BytesReader(fh.read(pagesize))
 
         self.br = br
         self.preceding, self.entrycount = br.reads("LH")
@@ -367,8 +367,7 @@ class Page:
             if ent.recofs < self.datastart:
                 raise NotImplementedError("unexpected entry data before page.datastart")
 
-        # bw = self.rebuild(args, br)
-        # fh.fo.write(bw.data)
+        self.modifications = 0
 
     def isindex(self):
         return self.preceding != 0
@@ -425,19 +424,26 @@ class Page:
         if self.free_bytes < 0:
             raise NotImplementedError("no more space in this page")
 
-        bw = BytesWriter(self.br.data)
-        bw.writes("LH", self.preceding, self.entrycount)
+        if self.modifications == 0:
+            self.bw = BytesWriter(self.br.data)
+        else:
+            self.bw.seek(0)
+
+        self.bw.writes("LH", self.preceding, self.entrycount)
 
         for ent in self.entries:
-            ent.write_head(bw)
+            ent.write_head(self.bw)
 
         self.datastart -= total_expand
-        bw.writes("LH", self.unk, self.datastart)
+        self.bw.writes("LH", self.unk, self.datastart)
         for ent in self.entries:
-            ent.write_data(bw)
+            ent.write_data(self.bw)
 
+        self.modifications += 1
+
+    def save(self):
         self.fh.seek(self.offset)
-        self.fh.write(bw.data)
+        self.fh.write(self.bw.data)
 
 
 class Cursor:
@@ -516,32 +522,32 @@ class Cursor:
         return "cursor:" + repr(self.stack)
 
 class ID0:
-    def __init__(self, fh, args):
-        self.fh = fh
-        comp, sectlen = self.fh.reads("BQ")
-        if comp:
-            raise NotImplementedError("compressed")
-        self.start = fh.tell()
+    def __init__(self, ofh):
+        self.ofh = ofh
+        self.comp, self.size = ofh.reads("BQ")
+        self.writestart = self.ofh.tell()
+        if self.comp == 0:
+            self.fs = ofh
+        elif self.comp == 2:
+            self.fs = io.BytesIO(zlib.decompress(ofh.read(self.size), 15))
+        else:
+            raise NotImplementedError("unsupported compression type")
 
-        btreedata = self.fh.read(64)
+        self.start = self.fs.tell()
+        btreedata = self.fs.read(64)
         self.firstfree, self.pagesize, self.firstindex, \
             self.reccount, self.pagecount = unpack("LHLLL", btreedata)
         if not btreedata[19:].startswith(b"B-tree v2"):
             raise NotImplementedError("unknown b-tree format")
 
-        self.fh.read(self.pagesize - 64)  # rest of btree info
-        self.fh.read(self.pagesize)  # page left intentionally blank
+        self.fs.read(self.pagesize - 64)  # rest of btree info
+        self.fs.read(self.pagesize)  # page left intentionally blank
 
-        # print(f'reading id0: {self.pagecount} pages')
-        #
-        # pages = []
-        # for i in range(self.pagecount):
-        #     print('reading page', i)
-        #     pages.append(self.readpage(i))
+        self.edits = {}
 
     def readpage(self, nr):
-        self.fh.seek(self.start + nr * self.pagesize)
-        return Page(self.fh, nr, self.pagesize)
+        self.fs.seek(self.start + nr * self.pagesize)
+        return Page(self.fs, nr, self.pagesize)
 
     def namekey(self, name):
         if type(name) == int:
@@ -605,6 +611,19 @@ class ID0:
             cur.next()
         return data, affected
 
+    def save(self):
+        for page in self.edits.values():
+            print('saving page', page.i)
+            page.save()  # if not compressed writes directly to file
+        if self.comp:
+            self.fs.seek(0)
+            compressed = zlib.compress(self.fs.read())
+            if len(compressed) > self.size:
+                raise NotImplementedError("zipped size changed - need to move other sections forward")
+            self.ofh.seek(self.writestart)
+            self.ofh.write(compressed)
+
+
 class IDBFile:
     def __init__(self, fh: FileHandler):
         self.fh = fh
@@ -623,10 +642,10 @@ class IDBFile:
 def processfile(args):
     fh = FileHandler(args.target)
     idb = IDBFile(fh)
-    id0 = ID0(idb.fh, args)
+    id0 = ID0(idb.fh)
 
     fdl = FuncDirList(id0)
-    if args.listbefore:
+    if args.list:
         fdl.print()
 
     if args.check:
@@ -641,17 +660,22 @@ def processfile(args):
     if args.listafter:
         fdl.print()
 
+    id0.save()
     fh.close()
 
 
 class FuncDirList:
     def __init__(self, id0):
+        # same as: idbtool.py a/a.i64 --query "$ dirtree/funcs;S;0"
         rootnode = id0.nodeByName('$ dirtree/funcs')
         if not rootnode:
             raise ValueError('no function tree entry')
 
+        # same as: idbtool.py a/a.i64 --query "$ dirtree/funcs;B;0"
         overview, self.ov_affected = id0.blob(rootnode, 'B', 0, 0xFFFF)
-        self.first_dir, self.afterlast_dir = struct.unpack("BB", overview[:2])
+        p = IdaUnpacker(overview)
+        self.first_dir = p.next32()
+        self.afterlast_dir = p.next32()
 
         # TODO: decypher
         # sorted_raw = overview[2:]
@@ -665,6 +689,7 @@ class FuncDirList:
         while True:
             start = i * 0x10000
             end = start + 0xFFFF
+            # same as: idbtool.py a/a.i64 --query "$ dirtree/funcs;S;65536"
             data, affected = id0.blob(rootnode, 'S', start, end)
             if data == b'':
                 break
@@ -687,11 +712,11 @@ class FuncDirList:
         i, newparent = args
         oldparent = self.dirs[i].parent
         self.dirs[oldparent].subdirs.remove(i)
-        self.dirs[oldparent].save()
+        self.dirs[oldparent].apply()
         self.dirs[newparent].subdirs.append(i)
-        self.dirs[newparent].save()
+        self.dirs[newparent].apply()
         self.dirs[i].parent = newparent
-        self.dirs[i].save()
+        self.dirs[i].apply()
 
     def checktree(self):
         # check if parent of A has A as subdir
@@ -770,7 +795,7 @@ class FuncDir:
         if newname != self.name:
             self.modified = True
             self.name = newname
-            self.save()
+            self.apply()
 
     def pack(self):
         name = b'\x00' + self.name.encode('utf-8') + b'\x00'
@@ -801,20 +826,25 @@ class FuncDir:
         return newdata
 
 
-    def save(self):
-        print('saving FuncDir', self.i)
+    def apply(self):
+        print('applying FuncDir', self.i)
         if len(self.affected) > 1:
             raise NotImplementedError("dir data spans across multiple Entries")
         for page_i, entry_i in self.affected:
             print(f'  affected page {page_i} entry {entry_i}')
             newdata = self.pack()
-            page = self.id0.readpage(page_i)
-            page.rebuild(entry_i, newdata)
+            if page_i in self.id0.edits:
+                page = self.id0.edits[page_i]
+                page.rebuild(entry_i, newdata)
+            else:
+                page = self.id0.readpage(page_i)
+                page.rebuild(entry_i, newdata)
+                self.id0.edits[page_i] = page
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(epilog="""
-Modifies function folder tree data inside a .i64 file.
+Modifies funcdir tree data inside a .i64 file.
 
 Examples:
 
@@ -824,11 +854,11 @@ Examples:
 """)
     parser.add_argument("--copyfrom")
     parser.add_argument("target")
-    parser.add_argument('--listbefore', action='store_true', help='print initial funcdir structure')
-    parser.add_argument('--listafter', action='store_true', help='print modified funcdir structure')
+    parser.add_argument('--list', action='store_true', help='print initial funcdir tree')
     parser.add_argument('--check', action='store_true', help='print consistency check results')
     parser.add_argument('--rename', nargs=2, help='string search and replace in folder names')
     parser.add_argument('--move', nargs=2, type=int, help='move folder #i to a new parent #j')
+    parser.add_argument('--listafter', action='store_true', help='print modified funcdir tree')
     args = parser.parse_args()
 
     if args.copyfrom:

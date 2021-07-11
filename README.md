@@ -6,7 +6,7 @@ This tool is supposed to fix IDA 7.5 files saved with inconsistent function fold
 
 ✅ modify folder parent/subs
 
-❌ compressed file support
+✅ compressed file support
 
 ❌ add folder
 
