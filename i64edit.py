@@ -50,6 +50,8 @@ def binary_search(a, k):
             first = mid + 1
     return first - 1
 
+def remove_duplicates(items):
+    return list(dict.fromkeys(items))
 
 class IdaUnpacker:
     def __init__(self, data):
@@ -302,17 +304,13 @@ class Entry:
         self.recofs -= acc
         return acc
 
-    def print_if(self):
-        # if self.key.startswith(b'N$ dirtree/funcs'):
-        #     print(self.__class__, 'N$ dirtree/funcs', hexdump(self.key), hexdump(self.val))
-        # if self.key.startswith(binascii.a2b_hex('2eff000000000000da53')):
-        #     print(self.__class__, 'funcdir', hexdump(self.key), hexdump(self.val[:16]),
-        #           self.recofs, '...', self.recofs + 2 + self.keylen + 2 + self.vallen)
-        pass
 
 class IndexEntry(Entry):
-    def __init__(self, br: BytesReader, i):
+    def __init__(self, i):
         super().__init__(i)
+        self.npage = 0
+
+    def read_head(self, br: BytesReader):
         self.npage, self.recofs = br.reads("LH")
 
     def write_head(self, bw: BytesWriter):
@@ -321,12 +319,15 @@ class IndexEntry(Entry):
     def read_data(self, args, br: BytesReader, prevkey):
         super().read_data(args, br, prevkey)
         self.key = self.rawkey
-        self.print_if()
 
 class LeafEntry(Entry):
-    def __init__(self, bh: BytesReader, i):
+    def __init__(self, i):
         super().__init__(i)
-        self.indent, self.unk, self.recofs = bh.reads("HHH")
+        self.indent = 0
+        self.unk = 0
+
+    def read_head(self, br: BytesReader):
+        self.indent, self.unk, self.recofs = br.reads("HHH")
 
     def write_head(self, bw: BytesWriter):
         bw.writes("HHH", self.indent, self.unk, self.recofs)
@@ -334,10 +335,9 @@ class LeafEntry(Entry):
     def read_data(self, args, br, prevkey):
         super().read_data(args, br, prevkey)
         self.key = prevkey[:self.indent] + self.rawkey
-        self.print_if()
 
 class Page:
-    def __init__(self, fh: FileHandler, i, pagesize):
+    def __init__(self, fh, i, pagesize):
         self.i = i
         self.fh = fh
         self.offset = fh.tell()
@@ -349,13 +349,14 @@ class Page:
         #     fh.fo.write(br.data)
         #     return
 
-        entryType = LeafEntry
+        self.entryType = LeafEntry
         if self.preceding:
-            entryType = IndexEntry
+            self.entryType = IndexEntry
 
         self.entries = []
         for i in range(self.entrycount):
-            ent = entryType(br, i)
+            ent = self.entryType(i)
+            ent.read_head(br)
             self.entries.append(ent)
         self.unk, self.datastart = br.reads("LH")
         self.free_bytes = self.datastart - br.tell()
@@ -410,7 +411,7 @@ class Page:
         """ For all page types, returns the value for the specified entry """
         return self.entries[ix].val
 
-    def rebuild(self, ix, newval):
+    def rebuild_modify(self, ix, newval):
         total_expand = 0
         for ent in sorted(self.entries, key=lambda e: e.recofs, reverse=True):
             # walk page entries data backwards and move left if expanded
@@ -424,6 +425,45 @@ class Page:
         if self.free_bytes < 0:
             raise NotImplementedError("no more space in this page")
 
+        self.datastart -= total_expand
+        self.prepare_save()
+
+    def rebuild_insert_entry(self, entry_i, entry_key, entry_val):
+        ent = self.entryType(entry_i)
+        self.entries.insert(entry_i, ent)
+        self.entrycount += 1
+
+        ent.key = entry_key
+
+        if self.isleaf():
+            prevkey = self.entries[entry_i - 1].key
+            ent.indent = 0
+            for a, b in zip(prevkey, entry_key):
+                if a == b:
+                    ent.indent += 1
+                else:
+                    break
+            ent.rawkey = entry_key[ent.indent:]
+        else:
+            ent.rawkey = entry_key
+
+        ent.keylen = len(ent.rawkey)
+        ent.val = entry_val
+        ent.vallen = len(entry_val)
+
+        headlen = 6
+        datalen = 2 + ent.vallen + 2 + ent.keylen
+        entlen = headlen + datalen
+
+        self.free_bytes -= entlen
+        if self.free_bytes < 0:
+            raise NotImplementedError("no more space in this page")
+
+        ent.recofs = self.datastart - entlen
+        self.datastart = ent.recofs
+        self.prepare_save()
+
+    def prepare_save(self):
         if self.modifications == 0:
             self.bw = BytesWriter(self.br.data)
         else:
@@ -434,7 +474,6 @@ class Page:
         for ent in self.entries:
             ent.write_head(self.bw)
 
-        self.datastart -= total_expand
         self.bw.writes("LH", self.unk, self.datastart)
         for ent in self.entries:
             ent.write_data(self.bw)
@@ -521,11 +560,16 @@ class Cursor:
     def __repr__(self):
         return "cursor:" + repr(self.stack)
 
+
+def makekey(nodeid, tag, start):
+    return struct.pack('>sQsQ', b'.', nodeid, tag.encode('utf-8'), start)
+
 class ID0:
     def __init__(self, ofh):
         self.ofh = ofh
         self.comp, self.size = ofh.reads("BQ")
         self.writestart = self.ofh.tell()
+        self.modified = False
         if self.comp == 0:
             self.fs = ofh
         elif self.comp == 2:
@@ -540,12 +584,10 @@ class ID0:
         if not btreedata[19:].startswith(b"B-tree v2"):
             raise NotImplementedError("unknown b-tree format")
 
-        self.fs.read(self.pagesize - 64)  # rest of btree info
-        self.fs.read(self.pagesize)  # page left intentionally blank
-
         self.edits = {}
 
     def readpage(self, nr):
+        """ reads from file """
         self.fs.seek(self.start + nr * self.pagesize)
         return Page(self.fs, nr, self.pagesize)
 
@@ -595,23 +637,24 @@ class ID0:
     def blob(self, nodeid, tag, start=0, end=0xFFFFFFFF):
         """ returns combined data between multiple entries and all affected pages"""
 
-        def makekey(nodeid, tag, start):
-            return struct.pack('>sQsQ', b'.', nodeid, tag.encode('utf-8'), start)
-
         startkey = makekey(nodeid, tag, start)
         endkey = makekey(nodeid, tag, end)
         cur = self.find('ge', startkey)
         data = b''
-        affected = set()
+        affected = []
         while cur.getkey() <= endkey:
             page, entry_i = cur.getpageix()
-            affected.add((page.i, entry_i))
+            affected.append((page.i, entry_i))
             chunk = page.entries[entry_i].val
             data += chunk
             cur.next()
+        affected = remove_duplicates(affected)
         return data, affected
 
     def save(self):
+        if not self.modified:
+            return
+        print('saving target file...')
         for page in self.edits.values():
             print('saving page', page.i)
             page.save()  # if not compressed writes directly to file
@@ -657,6 +700,9 @@ def processfile(args):
     if args.move:
         fdl.move(args.move)
 
+    if args.insert:
+        fdl.insert(args.insert)
+
     if args.listafter:
         fdl.print()
 
@@ -666,39 +712,46 @@ def processfile(args):
 
 class FuncDirList:
     def __init__(self, id0):
+        self.id0 = id0
         # same as: idbtool.py a/a.i64 --query "$ dirtree/funcs;S;0"
-        rootnode = id0.nodeByName('$ dirtree/funcs')
-        if not rootnode:
+        self.rootnode = id0.nodeByName('$ dirtree/funcs')
+        if not self.rootnode:
             raise ValueError('no function tree entry')
 
         # same as: idbtool.py a/a.i64 --query "$ dirtree/funcs;B;0"
-        overview, self.ov_affected = id0.blob(rootnode, 'B', 0, 0xFFFF)
+        overview, self.ov_affected = id0.blob(self.rootnode, 'B', 0, 0xFFFF)
         p = IdaUnpacker(overview)
         self.first_dir = p.next32()
-        self.afterlast_dir = p.next32()
+        self.dircount = p.next32()
 
         # TODO: decypher
-        # sorted_raw = overview[2:]
-        # sorted_len = len(sorted_raw)
-        # sorted_dirs = struct.unpack(f"{sorted_len}B", sorted_raw)
-        # sorted_dirs = [v for v in sorted_dirs]
-        # print(sorted_dirs)
+        self.sort_info = []
+        while not p.eof():
+            self.sort_info.append(p.next32())
 
         self.dirs = {}
-        i = 0
-        while True:
+
+        for i in range(self.dircount):
+            if 0 < i < self.first_dir:
+                i = self.first_dir
+
             start = i * 0x10000
             end = start + 0xFFFF
             # same as: idbtool.py a/a.i64 --query "$ dirtree/funcs;S;65536"
-            data, affected = id0.blob(rootnode, 'S', start, end)
+            data, affected = id0.blob(self.rootnode, 'S', start, end)
+            print(f'funcdir {i} affected {affected}')
             if data == b'':
-                break
+                print(f"funcdir {i} data empty")
+                continue
             self.dirs[i] = FuncDir(id0, i, data, affected)
-            i += 1
-            if 0 < i < self.first_dir:
-                i = self.first_dir
-        if i > self.afterlast_dir:
-            raise Exception("directory count mismatch")
+
+        i = self.dircount
+        start = i * 0x10000
+        end = start + 0xFFFF
+        data, affected = id0.blob(self.rootnode, 'S', start, end)
+        if data != b'':
+            print("there are extra dir entries")
+
 
     def print(self):
         for d in self.dirs.values():
@@ -712,11 +765,57 @@ class FuncDirList:
         i, newparent = args
         oldparent = self.dirs[i].parent
         self.dirs[oldparent].subdirs.remove(i)
-        self.dirs[oldparent].apply()
+        self.dirs[oldparent].apply_edit()
         self.dirs[newparent].subdirs.append(i)
-        self.dirs[newparent].apply()
+        self.dirs[newparent].apply_edit()
         self.dirs[i].parent = newparent
-        self.dirs[i].apply()
+        self.dirs[i].apply_edit()
+
+    def insert(self, args):
+        i, newparent = args
+        if i in self.dirs:
+            raise ValueError(f"dir {i} already exists")
+
+        left_siblings = [v for k, v in self.dirs.items() if k < i]
+        if not left_siblings:
+            raise ValueError("no funcdir entries. need at least one sibling to attach to")
+        left_sibling = left_siblings[-1]
+
+        # new entry will be the next after left sibling
+        page_i, entry_i = left_sibling.affected[-1]
+        affected = [(page_i, entry_i+1)]
+
+        d = FuncDir(self.id0, i, None, affected)
+        self.dirs[i] = d
+        d.name = f'newfolder_{i}'
+        d.parent = newparent
+        entry_key = makekey(self.rootnode, 'S', i * 0x10000)
+        d.apply_insert(entry_key)
+
+        self.dirs[newparent].subdirs.append(i)
+        self.dirs[newparent].apply_edit()
+
+        self.dircount = len(self.dirs)
+        print("applying overview")
+        if len(self.ov_affected) > 1:
+            raise NotImplementedError("overview data spans across multiple Entries")
+        for page_i, entry_i in self.ov_affected:
+            print(f'  affected page {page_i} entry {entry_i}')
+            p = IdaPacker()
+            p.push32(self.first_dir)
+            p.push32(self.dircount)
+            for s in self.sort_info:
+                p.push32(s)
+            newdata = p.data
+
+            if page_i in self.id0.edits:
+                page = self.id0.edits[page_i]
+                page.rebuild_modify(entry_i, newdata)
+            else:
+                page = self.id0.readpage(page_i)
+                page.rebuild_modify(entry_i, newdata)
+                self.id0.edits[page_i] = page
+
 
     def checktree(self):
         # check if parent of A has A as subdir
@@ -746,12 +845,22 @@ class FuncDir:
     def __init__(self, id0: ID0, i, data, affected):
         self.id0 = id0
         self.i = i
-        self.modified = False
         self.affected = affected
+
+        self.name = ''
+        self.parent = 0
+        self.unk32 = 0
+        self.subdirs = []
+        self.funcs = []
+
+        if data:
+            self.parse(data)
+
+    def parse(self, data):
         terminate = data.find(b'\0', 1)
         self.name = data[1:terminate].decode('utf-8')
 
-        p = IdaUnpacker(data[terminate+1:])
+        p = IdaUnpacker(data[terminate + 1:])
         self.parent = p.next64()
         self.unk32 = p.next32()
         subdir_count = p.next32()
@@ -776,7 +885,6 @@ class FuncDir:
         if not p.eof():
             raise Exception('not EOF after dir parsed')
 
-
     def print(self):
         print("dir %d = %s" % (self.i, self.name))
         print(" parent = %d" % self.parent)
@@ -793,9 +901,8 @@ class FuncDir:
     def rename(self, args):
         newname = self.name.replace(*args)
         if newname != self.name:
-            self.modified = True
             self.name = newname
-            self.apply()
+            self.apply_edit()
 
     def pack(self):
         name = b'\x00' + self.name.encode('utf-8') + b'\x00'
@@ -825,9 +932,8 @@ class FuncDir:
         newdata = name + p.data
         return newdata
 
-
-    def apply(self):
-        print('applying FuncDir', self.i)
+    def apply_edit(self):
+        print(f'applying FuncDir {self.i}')
         if len(self.affected) > 1:
             raise NotImplementedError("dir data spans across multiple Entries")
         for page_i, entry_i in self.affected:
@@ -835,29 +941,48 @@ class FuncDir:
             newdata = self.pack()
             if page_i in self.id0.edits:
                 page = self.id0.edits[page_i]
-                page.rebuild(entry_i, newdata)
+                page.rebuild_modify(entry_i, newdata)
             else:
                 page = self.id0.readpage(page_i)
-                page.rebuild(entry_i, newdata)
+                page.rebuild_modify(entry_i, newdata)
                 self.id0.edits[page_i] = page
+        self.id0.modified = True
+
+    def apply_insert(self, entry_key):
+        print(f'applying inserted FuncDir {self.i}')
+        page_i, entry_i = self.affected[0]
+        print(f'  affected page {page_i} entry {entry_i}')
+
+        entry_val = self.pack()
+        if page_i in self.id0.edits:
+            page = self.id0.edits[page_i]
+            page.rebuild_insert_entry(entry_i, entry_key, entry_val)
+        else:
+            page = self.id0.readpage(page_i)
+            page.rebuild_insert_entry(entry_i, entry_key, entry_val)
+            self.id0.edits[page_i] = page
+
+        self.id0.modified = True
+
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(epilog="""
-Modifies funcdir tree data inside a .i64 file.
-
+    parser = argparse.ArgumentParser(description='Modifies funcdir tree data inside a .i64 file',
+                                     formatter_class=argparse.RawDescriptionHelpFormatter, epilog="""
 Examples:
 
   i64edit target.i64 --list --check
   i64edit target.i64 --rename BadDirName GoodDirName
-  i64edit --copyfrom in.i64 out.i64 --move 12 14
+  i64edit target.i64 --move 12 14
+  i64edit --copyfrom in.i64 out.i64 --insert 4 1
 """)
-    parser.add_argument("--copyfrom")
-    parser.add_argument("target")
+    parser.add_argument("--copyfrom", metavar='filename', help='make a copy before modifying')
+    parser.add_argument("target", help='IDA database to modify')
     parser.add_argument('--list', action='store_true', help='print initial funcdir tree')
     parser.add_argument('--check', action='store_true', help='print consistency check results')
-    parser.add_argument('--rename', nargs=2, help='string search and replace in folder names')
-    parser.add_argument('--move', nargs=2, type=int, help='move folder #i to a new parent #j')
+    parser.add_argument('--rename', nargs=2, help='string search and replace in folder names', metavar=('from', 'to'))
+    parser.add_argument('--move', nargs=2, type=int, help='move folder #i to a new parent #j', metavar=('i', 'j'))
+    parser.add_argument('--insert', nargs=2, type=int, help='create folder #i with parent #j', metavar=('i', 'j'))
     parser.add_argument('--listafter', action='store_true', help='print modified funcdir tree')
     args = parser.parse_args()
 

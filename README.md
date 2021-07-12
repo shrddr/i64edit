@@ -8,7 +8,9 @@ This tool is supposed to fix IDA 7.5 files saved with inconsistent function fold
 
 ✅ compressed file support
 
-❌ add folder
+😐 add folder
+
+❌ automatic issue resolution
 
 Based on https://github.com/nlitsme/pyidbutil but with write capability.
 
