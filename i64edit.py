@@ -258,6 +258,12 @@ class FileHandler:
     def write(self, data):
         self.f.write(data)
 
+    def writes(self, fmt, *args):
+        fmt = '=' + fmt
+        i = struct.calcsize(fmt)
+        bs = struct.pack(fmt, *args)
+        self.write(bs)
+
     def tell(self):
         return self.f.tell()
 
@@ -564,11 +570,46 @@ class Cursor:
 def makekey(nodeid, tag, start):
     return struct.pack('>sQsQ', b'.', nodeid, tag.encode('utf-8'), start)
 
+class IDBFile:
+    def __init__(self, fh: FileHandler):
+        self.fh = fh
+        magic = fh.read(6)
+        if not magic.startswith(b"IDA2"):
+            raise Exception("invalid file format")
+
+        self.head = list(fh.reads("QQLLHQQQ5LQL"))
+        self.offsets = [self.head[_] for _ in (0, 1, 5, 6, 7, 13)]
+        self.checksums = [self.head[_] for _ in (8, 9, 10, 11, 12, 14)]
+
+    def move_section(self, i, amount):
+        if self.offsets[i] == 0:
+            return
+        self.fh.seek(self.offsets[i])
+        comp, size = self.fh.reads("BQ")
+        # print(f"moving section {i} from {self.offsets[i]}..{self.offsets[i] + size} "
+        #       f"to {self.offsets[i] + amount}..{self.offsets[i] + amount + size}")
+        sect_data = self.fh.read(size)
+        self.fh.seek(self.offsets[i] + amount)
+        self.fh.writes("BQ", comp, size)
+        self.fh.write(sect_data)
+        self.offsets[i] += amount
+
+    def write_head(self):
+        self.fh.seek(6)
+        for o, p in enumerate([0, 1, 5, 6, 7, 13]):
+            self.head[p] = self.offsets[o]
+        for o, p in enumerate([8, 9, 10, 11, 12, 14]):
+            self.head[p] = self.checksums[o]
+        self.fh.writes("QQLLHQQQ5LQL", *self.head)
+
+
 class ID0:
-    def __init__(self, ofh):
+    def __init__(self, idb: IDBFile):
+        self.idb = idb
+        ofh = idb.fh
+        ofh.seek(self.idb.offsets[0])
         self.ofh = ofh
         self.comp, self.size = ofh.reads("BQ")
-        self.writestart = self.ofh.tell()
         self.modified = False
         if self.comp == 0:
             self.fs = ofh
@@ -661,31 +702,22 @@ class ID0:
         if self.comp:
             self.fs.seek(0)
             compressed = zlib.compress(self.fs.read())
-            if len(compressed) > self.size:
-                raise NotImplementedError("zipped size changed - need to move other sections forward")
-            self.ofh.seek(self.writestart)
+            expand = len(compressed) - self.size
+            if expand > 0:
+                for i in range(len(self.idb.offsets) - 1, 0, -1):
+                    self.idb.move_section(i, expand)
+                self.idb.write_head()
+
+            self.size = len(compressed)
+            self.ofh.seek(self.idb.offsets[0])
+            self.ofh.writes("BQ", self.comp, self.size)
             self.ofh.write(compressed)
-
-
-class IDBFile:
-    def __init__(self, fh: FileHandler):
-        self.fh = fh
-        magic = fh.read(6)
-        if not magic.startswith(b"IDA2"):
-            raise Exception("invalid file format")
-
-        values = fh.reads("QQLLHQQQ5LQL")
-        self.offsets = [values[_] for _ in (0, 1, 5, 6, 7, 13)]
-        self.checksums = [values[_] for _ in (8, 9, 10, 11, 12, 14)]
-
-        rest = self.offsets[0] - fh.tell()
-        self.fh.read(rest)
 
 
 def processfile(args):
     fh = FileHandler(args.target)
     idb = IDBFile(fh)
-    id0 = ID0(idb.fh)
+    id0 = ID0(idb)
 
     fdl = FuncDirList(id0)
     if args.list:

@@ -4,13 +4,15 @@ This tool is supposed to fix IDA 7.5 files saved with inconsistent function fold
 
 ✅ modify folder name
 
-✅ modify folder parent/subs
+✅ move folder to another parent
+
+✅ add new folder
 
 ✅ compressed file support
 
-😐 add folder
-
 ❌ automatic issue resolution
+
+❌ if needed, add B-tree pages
 
 Based on https://github.com/nlitsme/pyidbutil but with write capability.
 
