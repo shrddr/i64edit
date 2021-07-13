@@ -2,6 +2,7 @@ import argparse
 import binascii
 import io
 import struct
+import sys
 import zlib
 from shutil import copyfile
 
@@ -701,9 +702,11 @@ class ID0:
             page.save()  # if not compressed writes directly to file
         if self.comp:
             self.fs.seek(0)
+            print('deflating...')
             compressed = zlib.compress(self.fs.read())
             expand = len(compressed) - self.size
             if expand > 0:
+                print('moving sections...')
                 for i in range(len(self.idb.offsets) - 1, 0, -1):
                     self.idb.move_section(i, expand)
                 self.idb.write_head()
@@ -734,9 +737,6 @@ def processfile(args):
 
     if args.insert:
         fdl.insert(args.insert)
-
-    if args.listafter:
-        fdl.print()
 
     id0.save()
     fh.close()
@@ -771,7 +771,7 @@ class FuncDirList:
             end = start + 0xFFFF
             # same as: idbtool.py a/a.i64 --query "$ dirtree/funcs;S;65536"
             data, affected = id0.blob(self.rootnode, 'S', start, end)
-            print(f'funcdir {i} affected {affected}')
+            # print(f'funcdir {i} located at: {affected}')
             if data == b'':
                 print(f"funcdir {i} data empty")
                 continue
@@ -824,8 +824,9 @@ class FuncDirList:
         entry_key = makekey(self.rootnode, 'S', i * 0x10000)
         d.apply_insert(entry_key)
 
-        self.dirs[newparent].subdirs.append(i)
-        self.dirs[newparent].apply_edit()
+        if i not in self.dirs[newparent].subdirs:
+            self.dirs[newparent].subdirs.append(i)
+            self.dirs[newparent].apply_edit()
 
         self.dircount = len(self.dirs)
         print("applying overview")
@@ -850,28 +851,34 @@ class FuncDirList:
 
 
     def checktree(self):
+        errcode = 0
         # check if parent of A has A as subdir
         for i, d in self.dirs.items():
             if i == 0:
                 continue
             if d.parent not in self.dirs:
                 print(f'dir {i} has parent {d.parent} but {d.parent} is not in tree')
+                errcode = 1
                 continue
             subdirs = self.dirs[d.parent].subdirs
             if i not in subdirs:
                 print(f'dir {i} has parent {d.parent} but {d.parent} has no subdir {i}')
+                errcode = 1
 
         # check if subdirs of A have A as parent
         for i, d in self.dirs.items():
             for subdir in d.subdirs:
                 if subdir not in self.dirs:
                     print(f'dir {i} has subdir {subdir} but {subdir} is not in tree')
+                    errcode = 1
                     continue
                 subdir_parent = self.dirs[subdir].parent
                 if subdir_parent != i:
                     print(f'dir {i} has subdir {subdir} but {subdir} parent is {subdir_parent}')
+                    errcode = 1
 
         print('check complete')
+        sys.exit(errcode)
 
 class FuncDir:
     def __init__(self, id0: ID0, i, data, affected):
@@ -997,7 +1004,6 @@ class FuncDir:
         self.id0.modified = True
 
 
-
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description='Modifies funcdir tree data inside a .i64 file',
                                      formatter_class=argparse.RawDescriptionHelpFormatter, epilog="""
@@ -1010,12 +1016,11 @@ Examples:
 """)
     parser.add_argument("--copyfrom", metavar='filename', help='make a copy before modifying')
     parser.add_argument("target", help='IDA database to modify')
-    parser.add_argument('--list', action='store_true', help='print initial funcdir tree')
-    parser.add_argument('--check', action='store_true', help='print consistency check results')
+    parser.add_argument('--list', action='store_true', help='print funcdir tree')
+    parser.add_argument('--check', action='store_true', help='check consistency (exit code 1 = have issues)')
     parser.add_argument('--rename', nargs=2, help='string search and replace in folder names', metavar=('from', 'to'))
     parser.add_argument('--move', nargs=2, type=int, help='move folder #i to a new parent #j', metavar=('i', 'j'))
     parser.add_argument('--insert', nargs=2, type=int, help='create folder #i with parent #j', metavar=('i', 'j'))
-    parser.add_argument('--listafter', action='store_true', help='print modified funcdir tree')
     args = parser.parse_args()
 
     if args.copyfrom:
