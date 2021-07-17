@@ -6,6 +6,9 @@ import sys
 import zlib
 from shutil import copyfile
 
+def auto_int(x):
+    return int(x, 0)
+
 def hexdump(data):
     if data is None:
         return
@@ -567,8 +570,10 @@ class Cursor:
     def __repr__(self):
         return "cursor:" + repr(self.stack)
 
+def makekey_name_tag(nodeid, tag):
+    return struct.pack('>sQs', b'.', nodeid, tag.encode('utf-8'))
 
-def makekey(nodeid, tag, start):
+def makekey_name_tag_start(nodeid, tag, start):
     return struct.pack('>sQsQ', b'.', nodeid, tag.encode('utf-8'), start)
 
 class IDBFile:
@@ -643,6 +648,19 @@ class ID0:
         if cur:
             return struct.unpack('Q', cur.getval())[0]
 
+    def nameof(self, ea):
+        cur = self.find('eq', makekey_name_tag(ea, 'N'))
+        if not cur:
+            print("%x has no name" % ea)
+            return
+        data = cur.getval()
+        if data[:1] == b'\x00':
+            raise NotImplementedError
+            # nameid, = struct.unpack_from("Q", data, 1)
+            # nameblob = self.blob(self.nodebase, 'S', nameid * 256, nameid * 256 + 32)
+            # return nameblob.rstrip(b"\x00").decode('utf-8')
+        return data.rstrip(b"\x00").decode('utf-8')
+
     def find(self, request, key):
         # descend tree to leaf nearest to the `key`
         page = self.readpage(self.firstindex)
@@ -679,8 +697,8 @@ class ID0:
     def blob(self, nodeid, tag, start=0, end=0xFFFFFFFF):
         """ returns combined data between multiple entries and all affected pages"""
 
-        startkey = makekey(nodeid, tag, start)
-        endkey = makekey(nodeid, tag, end)
+        startkey = makekey_name_tag_start(nodeid, tag, start)
+        endkey = makekey_name_tag_start(nodeid, tag, end)
         cur = self.find('ge', startkey)
         data = b''
         affected = []
@@ -734,6 +752,9 @@ def processfile(args):
 
     if args.move:
         fdl.move(args.move)
+
+    if args.movefunc:
+        fdl.movefunc(args.movefunc)
 
     if args.insert:
         fdl.insert(args.insert)
@@ -803,6 +824,17 @@ class FuncDirList:
         self.dirs[i].parent = newparent
         self.dirs[i].apply_edit()
 
+    def movefunc(self, args):
+        ea, newparent = args
+        for d in self.dirs.values():
+            if ea in d.funcs:
+                oldparent = d
+                oldparent.funcs.remove(ea)
+                oldparent.apply_edit()
+                break
+        self.dirs[newparent].funcs.append(ea)
+        self.dirs[newparent].apply_edit()
+
     def insert(self, args):
         i, newparent = args
         if i in self.dirs:
@@ -821,7 +853,7 @@ class FuncDirList:
         self.dirs[i] = d
         d.name = f'newfolder_{i}'
         d.parent = newparent
-        entry_key = makekey(self.rootnode, 'S', i * 0x10000)
+        entry_key = makekey_name_tag_start(self.rootnode, 'S', i * 0x10000)
         d.apply_insert(entry_key)
 
         if i not in self.dirs[newparent].subdirs:
@@ -931,9 +963,9 @@ class FuncDir:
         for subdir in self.subdirs:
             print("  %d" % subdir)
         # print("  functions:")
-        # for func in funcs:
+        # for func in self.funcs:
         #     print("  ", end="")
-        #     name = id0.name(func)
+        #     name = self.id0.nameof(func)
         #     if name:
         #         print("%x %s" % (func, name))
 
@@ -1012,15 +1044,18 @@ Examples:
   i64edit target.i64 --list --check
   i64edit target.i64 --rename BadDirName GoodDirName
   i64edit target.i64 --move 12 14
-  i64edit --copyfrom in.i64 out.i64 --insert 4 1
+  i64edit --copyfrom backup.i64 modified.i64 --insert 4 1
+  i64edit --copyfrom backup.i64 modified.i64 --movefunc 0x140001070 7
 """)
     parser.add_argument("--copyfrom", metavar='filename', help='make a copy before modifying')
     parser.add_argument("target", help='IDA database to modify')
     parser.add_argument('--list', action='store_true', help='print funcdir tree')
     parser.add_argument('--check', action='store_true', help='check consistency (exit code 1 = have issues)')
     parser.add_argument('--rename', nargs=2, help='string search and replace in folder names', metavar=('from', 'to'))
-    parser.add_argument('--move', nargs=2, type=int, help='move folder #i to a new parent #j', metavar=('i', 'j'))
-    parser.add_argument('--insert', nargs=2, type=int, help='create folder #i with parent #j', metavar=('i', 'j'))
+    parser.add_argument('--move', nargs=2, type=int, help='move folder #i to parent #j', metavar=('i', 'j'))
+    parser.add_argument('--insert', nargs=2, type=int, help='create folder #i at parent #j', metavar=('i', 'j'))
+    # parser.add_argument('--orphans', action='store_true', help='find functions not attached to a folder')
+    parser.add_argument('--movefunc', nargs=2, type=auto_int, help='move func ea to folder #f', metavar=('ea', 'f'))
     args = parser.parse_args()
 
     if args.copyfrom:
