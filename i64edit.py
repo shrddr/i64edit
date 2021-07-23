@@ -741,6 +741,9 @@ def processfile(args):
     id0 = ID0(idb)
 
     fdl = FuncDirList(id0)
+    if args.show:
+        fdl.dirs[args.show].print()
+
     if args.list:
         fdl.print()
 
@@ -962,12 +965,12 @@ class FuncDir:
         print(" subdirs:")
         for subdir in self.subdirs:
             print("  %d" % subdir)
-        # print("  functions:")
-        # for func in self.funcs:
-        #     print("  ", end="")
-        #     name = self.id0.nameof(func)
-        #     if name:
-        #         print("%x %s" % (func, name))
+        print("  functions:")
+        for func in self.funcs:
+            print("  ", end="")
+            name = self.id0.nameof(func)
+            if name:
+                print("%x %s" % (func, name))
 
     def rename(self, args):
         newname = self.name.replace(*args)
@@ -1050,6 +1053,7 @@ Examples:
     parser.add_argument("--copyfrom", metavar='filename', help='make a copy before modifying')
     parser.add_argument("target", help='IDA database to modify')
     parser.add_argument('--list', action='store_true', help='print funcdir tree')
+    parser.add_argument('--show', type=int, help='print funcdir #i info', metavar='i')
     parser.add_argument('--check', action='store_true', help='check consistency (exit code 1 = have issues)')
     parser.add_argument('--rename', nargs=2, help='string search and replace in folder names', metavar=('from', 'to'))
     parser.add_argument('--move', nargs=2, type=int, help='move folder #i to parent #j', metavar=('i', 'j'))
