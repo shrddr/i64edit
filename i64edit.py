@@ -631,6 +631,7 @@ class ID0:
         if not btreedata[19:].startswith(b"B-tree v2"):
             raise NotImplementedError("unknown b-tree format")
 
+        self.fdl = FuncDirList(self)
         self.edits = {}
 
     def readpage(self, nr):
@@ -740,27 +741,26 @@ def processfile(args):
     idb = IDBFile(fh)
     id0 = ID0(idb)
 
-    fdl = FuncDirList(id0)
     if args.show:
-        fdl.dirs[args.show].print()
+        id0.fdl.dirs[args.show].print()
 
     if args.list:
-        fdl.print()
+        id0.fdl.print()
 
     if args.check:
-        fdl.checktree()
+        id0.fdl.checktree()
 
     if args.rename:
-        fdl.rename(args.rename)
+        id0.fdl.rename(args.rename)
 
     if args.move:
-        fdl.move(args.move)
+        id0.fdl.move(args.move)
 
     if args.movefunc:
-        fdl.movefunc(args.movefunc)
+        id0.fdl.movefunc(args.movefunc)
 
     if args.insert:
-        fdl.insert(args.insert)
+        id0.fdl.insert(args.insert)
 
     id0.save()
     fh.close()
@@ -816,6 +816,11 @@ class FuncDirList:
     def rename(self, args):
         for d in self.dirs:
             d.rename(args)
+
+    def nameof(self, dirno):
+        if dirno in self.dirs:
+            return self.dirs[dirno].name
+        return '???'
 
     def move(self, args):
         i, newparent = args
@@ -960,17 +965,17 @@ class FuncDir:
             raise Exception('not EOF after dir parsed')
 
     def print(self):
-        print("dir %d = %s" % (self.i, self.name))
-        print(" parent = %d" % self.parent)
+        print(f"dir {self.i} = {self.name}")
+        print(f" parent = {self.parent} {self.id0.fdl.nameof(self.parent)}")
         print(" subdirs:")
         for subdir in self.subdirs:
-            print("  %d" % subdir)
-        print("  functions:")
+            print(f"  {subdir} {self.id0.fdl.nameof(subdir)}")
+        print(" functions:")
         for func in self.funcs:
             print("  ", end="")
             name = self.id0.nameof(func)
             if name:
-                print("%x %s" % (func, name))
+                print(f"{func:X} {name}")
 
     def rename(self, args):
         newname = self.name.replace(*args)
