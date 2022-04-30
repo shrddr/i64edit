@@ -2,9 +2,10 @@ This tool is supposed to fix IDA 7.5 files saved with inconsistent function fold
 
 Based on https://github.com/nlitsme/pyidbutil but with write capability.
 
-### Usage/A
+### Usage
+#### Method A
 
-If IDA is not running and you only have a damaged file on disk. First, check what's wrong (this is a readonly operation):
+If IDA is not running and you only have a damaged `bad.i64` file. First, check what's wrong (this is a readonly operation):
 
 ```
 python i64edit.py bad.i64 --check
@@ -38,14 +39,14 @@ The original contents of dir#147 will be lost and the functions it contained wil
 
 Orphaned functions have no parent dir, and are only shown in list view but not in folder view.
 
-If you happen to know the addresses of orphaned funcs, fix by `--movefunc`, for example add func at 14003BD10 to dir#147:
+You can move them back into manually in IDA, or automate by using `--movefunc`, for example add funcion at 14003BD10 to dir#147:
 
 ```
 python i64edit.py good.i64 --movefunc 14003BD10 147
 ```
 
-### Usage/B
-If you still have the project open in IDA and it looks alright, but is being saved incorrectly:
+#### Method B
+If you have the project `online.i64` currently open in IDA and it looks alright, but is being saved to disk incorrectly:
 
 ```
 python i64edit.py online.i64 --check
@@ -63,11 +64,11 @@ dir 7 = filehandling
   148 unpack
 ```
 
-There is no name assotiated with dir#147, but you can examine dir#7 'filehandling' in IDA and try to guess which one of its children is dir#147.
+There is no name assotiated with dir#147 in the file, but since you have the project open, look at dir#7 in IDA (name is 'filehandling') and determine which one of its children is dir#147.
 
-Delete and recreate dir#147 using IDA, and the project should now save correctly. Run `--check` once again to be sure (there might be additional issues).
+Delete and recreate dir#147 in IDA, and the project should now save correctly. Run `--check` on the new file to be sure (there might be additional issues).
 
-Since this is less damaging then the method above, I always run `--check` before closing IDA, to fix the potential problems in place.
+Since this method is easier then the method A, I always run `--check` before closing IDA, to fix the potential problems while it's not too late.
 
 ### TODO
 
