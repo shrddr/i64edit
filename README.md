@@ -39,7 +39,7 @@ The original contents of dir#147 will be lost and the functions it contained wil
 
 Orphaned functions have no parent dir, and are only shown in list view but not in folder view.
 
-You can move them back into manually in IDA, or automate by using `--movefunc`, for example add funcion at 14003BD10 to dir#147:
+You can move them back into manually in IDA, or automate by using `--movefunc`, for example add funtion at 14003BD10 to dir#147:
 
 ```
 python i64edit.py good.i64 --movefunc 14003BD10 147
@@ -66,9 +66,9 @@ dir 7 = filehandling
 
 There is no name assotiated with dir#147 in the file, but since you have the project open, look at dir#7 in IDA (name is 'filehandling') and determine which one of its children is dir#147.
 
-Delete and recreate dir#147 in IDA, and the project should now save correctly. Run `--check` on the new file to be sure (there might be additional issues).
+While IDA is still running, you can delete and recreate dir#147, and the project should now save correctly. Run `i64edit.py --check` on the new file to be sure (there might be additional issues).
 
-Since this method is easier then the method A, I always run `--check` before closing IDA, to fix the potential problems while it's not too late.
+Since this method is easier then the method A, I always run `--check` before closing IDA 7.5, to catch a potential problem while it's easy to fix.
 
 ### TODO
 
