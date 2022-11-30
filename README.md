@@ -39,11 +39,13 @@ The original contents of dir#147 will be lost and the functions it contained wil
 
 Orphaned functions have no parent dir, and are only shown in list view but not in folder view.
 
-You can move them back into manually in IDA, or automate by using `--movefunc`, for example add funtion at 14003BD10 to dir#147:
+You can move them back into manually in IDA, or automate by using `--movefunc`, for example add function at 14003BD10 into dir#147:
 
 ```
 python i64edit.py good.i64 --movefunc 14003BD10 147
 ```
+
+Uncorrrupted dirs we are not touching and after the fix they should be shown correctly with all their children.
 
 #### Method B
 If you have the project `online.i64` currently open in IDA and it looks alright, but is being saved to disk incorrectly:
