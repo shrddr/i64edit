@@ -1,4 +1,4 @@
-This tool is supposed to fix IDA 7.5 files saved with inconsistent function folder tree. In IDA this leads to empty Functions view when you tick Show folders, but otherwise no error is given.
+This tool is supposed to fix IDA 7.5 files saved with inconsistent function folder tree. After loading the corrupted file from disk it shows empty Functions view with Show folders on, but otherwise no error is given. IDA 7.6 does not have this issue of saving incosistent files.
 
 Based on https://github.com/nlitsme/pyidbutil but with write capability.
 
@@ -39,16 +39,14 @@ The original contents of dir#147 will be lost and the functions it contained wil
 
 Orphaned functions have no parent dir, and are only shown in list view but not in folder view.
 
-You can move them back into manually in IDA, or automate by using `--movefunc`, for example add function at 14003BD10 into dir#147:
+You can move them back into dir#147 manually in IDA, or automate by using `i64edit.py --movefunc`, for example put function at 14003BD10 into dir#147:
 
 ```
 python i64edit.py good.i64 --movefunc 14003BD10 147
 ```
 
-Uncorrrupted dirs we are not touching and after the fix they should be shown correctly with all their children.
-
 #### Method B
-If you have the project `online.i64` currently open in IDA and it looks alright, but is being saved to disk incorrectly:
+If you have the project `online.i64` currently open in IDA and it looks alright, but there is a chance it's alredy being saved to disk incorrectly:
 
 ```
 python i64edit.py online.i64 --check
@@ -66,11 +64,13 @@ dir 7 = filehandling
   148 unpack
 ```
 
-There is no name assotiated with dir#147 in the file, but since you have the project open, look at dir#7 in IDA (name is 'filehandling') and determine which one of its children is dir#147.
+Here is the problem: there is no name assotiated with dir#147 in the file. 
+
+But since you have the project open, look at dir#7 in IDA (name is 'filehandling') and determine which one of its children is dir#147.
 
 While IDA is still running, you can delete and recreate dir#147, and the project should now save correctly. Run `i64edit.py --check` on the new file to be sure (there might be additional issues).
 
-Since this method is easier then the method A, I always run `--check` before closing IDA 7.5, to catch a potential problem while it's easy to fix.
+Since this method is easier then the method A, I always run `--check` before closing IDA 7.5 to catch a potential problem while it's easy to fix.
 
 ### TODO
 
