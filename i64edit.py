@@ -580,8 +580,8 @@ class IDBFile:
     def __init__(self, fh: FileHandler):
         self.fh = fh
         magic = fh.read(6)
-        if not magic.startswith(b"IDA2"):
-            raise Exception("invalid file format")
+        if not magic.startswith(b"IDA1") and not magic.startswith(b"IDA2"):
+            raise Exception("unsupported file format")
 
         self.head = list(fh.reads("QQLLHQQQ5LQL"))
         self.offsets = [self.head[_] for _ in (0, 1, 5, 6, 7, 13)]
@@ -769,12 +769,12 @@ def processfile(args):
 class FuncDirList:
     def __init__(self, id0):
         self.id0 = id0
-        # same as: idbtool.py a/a.i64 --query "$ dirtree/funcs;S;0"
+        # same as: idbtool.py file.i64 --query "$ dirtree/funcs;S;0"
         self.rootnode = id0.nodeByName('$ dirtree/funcs')
         if not self.rootnode:
             raise ValueError('no function tree entry')
 
-        # same as: idbtool.py a/a.i64 --query "$ dirtree/funcs;B;0"
+        # same as: idbtool.py file.i64 --query "$ dirtree/funcs;B;0"
         overview, self.ov_affected = id0.blob(self.rootnode, 'B', 0, 0xFFFF)
         p = IdaUnpacker(overview)
         self.first_dir = p.next32()
@@ -793,7 +793,7 @@ class FuncDirList:
 
             start = i * 0x10000
             end = start + 0xFFFF
-            # same as: idbtool.py a/a.i64 --query "$ dirtree/funcs;S;65536"
+            # same as: idbtool.py file.i64 --query "$ dirtree/funcs;S;65536"
             data, affected = id0.blob(self.rootnode, 'S', start, end)
             # print(f'funcdir {i} located at: {affected}')
             if data == b'':
@@ -936,33 +936,73 @@ class FuncDir:
             self.parse(data)
 
     def parse(self, data):
+        schema = 75
+        if data[0] == 1:
+            schema = 76
+
         terminate = data.find(b'\0', 1)
         self.name = data[1:terminate].decode('utf-8')
 
         p = IdaUnpacker(data[terminate + 1:])
         self.parent = p.next64()
         self.unk32 = p.next32()
-        subdir_count = p.next32()
 
-        self.subdirs = []
-        while subdir_count:
-            subdir_id = p.next64signed()
-            if self.subdirs:
-                subdir_id = self.subdirs[-1] + subdir_id
-            self.subdirs.append(subdir_id)
-            subdir_count -= 1
+        if schema == 75:
+            subdir_count = p.next32()
+            self.subdirs = []
+            while subdir_count:
+                subdir_id = p.next64signed()
+                if self.subdirs:
+                    subdir_id = self.subdirs[-1] + subdir_id
+                self.subdirs.append(subdir_id)
+                subdir_count -= 1
 
-        func_count = p.next32()
-        self.funcs = []
-        while func_count:
-            func_id = p.next64signed()
-            if self.funcs:
-                func_id = self.funcs[-1] + func_id
-            self.funcs.append(func_id)
-            func_count -= 1
+            func_count = p.next32()
+            self.funcs = []
+            while func_count:
+                func_id = p.next64signed()
+                if self.funcs:
+                    func_id = self.funcs[-1] + func_id
+                self.funcs.append(func_id)
+                func_count -= 1
+
+        elif schema == 76:
+            children_count = p.next32()
+            # all children are stored together, with no hint is it subdir or func
+
+            children = []
+            for i in range(children_count):
+                if not children:
+                    children.append(p.next64signed())
+                else:
+                    children.append(children[-1] + p.next64signed())
+
+            # interleaved counts: K sudbirs, [L funcs, [M subdirs, [N funcs, ...]]]
+            subdir_count = p.next32()
+            children_count -= subdir_count
+            childtype_counts = [subdir_count]
+            while children_count:
+                childtype_count = p.next32()
+                children_count -= childtype_count
+                childtype_counts.append(childtype_count)
+
+            self.subdirs = []
+            self.funcs = []
+            i = 0
+            parsing_subdirs = True  # switch back and forth
+            for childtype_count in childtype_counts:
+                for _ in range(childtype_count):
+                    if parsing_subdirs:
+                        self.subdirs.append(children[i])
+                    else:
+                        self.funcs.append(children[i])
+                    i += 1
+                parsing_subdirs = not parsing_subdirs
+        else:
+            raise NotImplementedError('unsupported funcdir schema')
 
         if not p.eof():
-            raise Exception('not EOF after dir parsed')
+            raise NotImplementedError('not EOF after dir parsed')
 
     def print(self):
         print(f"dir {self.i} = {self.name}")
